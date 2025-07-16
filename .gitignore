@@ -1,0 +1,15 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore virtual environments (used for local setup)
+.venv/
+env/
+venv/
+
+# Skip input/output folders used at runtime
+input/
+output/
+
+# Ignore environment variable files if used later
+.env
