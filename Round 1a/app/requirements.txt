@@ -1,9 +1,9 @@
-pymupdf==1.23.7
-pytesseract==0.3.10
-Pillow==10.3.0
-spacy==3.7.4
-scikit-learn==1.4.2
-numpy==1.26.4
+PyMuPDF
+numpy
+spacy
+scikit-learn
+pytesseract
+Pillow
 
 # Add Tesseract to your system path
 
