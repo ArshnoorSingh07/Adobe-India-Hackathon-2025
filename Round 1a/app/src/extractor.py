@@ -114,3 +114,149 @@ def filter_repeated_lines(lines, min_repeats=3, min_length=3):
     repeated_texts = set(text for text, count in text_counter.items() if count >= min_repeats or count > 0.3 * total_pages)
     filtered = [l for l in lines if l["text"] not in repeated_texts]
     return filtered, repeated_texts
+
+def extract_spans(pdf_path):
+    # Extracts individual text spans (with font, position info) from each page
+    doc = fitz.open(pdf_path)
+    spans = []
+    for page in doc:
+        page_width = page.rect.width
+        text_blocks = page.get_text("dict")["blocks"]
+        has_text = any(block.get("type", 0) == 0 and block.get("lines") for block in text_blocks)
+
+        if has_text:
+            # Digital PDF page
+            for block in text_blocks:
+                if block.get("type", 0) != 0:
+                    continue
+                full_text = " ".join(span["text"].strip() for line in block.get("lines", []) for span in line.get("spans", []))
+                if is_table_like_line(full_text):
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span["text"].strip()
+                        if not text:
+                            continue
+                        spans.append({
+                            "text": text,
+                            "size": span["size"],
+                            "font": span["font"],
+                            "flags": span["flags"],
+                            "page": page.number,
+                            "x0": span["bbox"][0],
+                            "x1": span["bbox"][2],
+                            "y0": span["bbox"][1],
+                            "width": page_width,
+                            "ocr": False
+                        })
+        else:
+            # Scanned/image-based page: use OCR
+            pix = page.get_pixmap(matrix=fitz.Matrix(2,2))
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, lang=OCR_LANGS)
+            n_boxes = len(ocr_data['level'])
+            for i in range(n_boxes):
+                text = ocr_data['text'][i].strip()
+                if not text:
+                    continue
+                size = ocr_data['height'][i] / 2
+                spans.append({
+                    "text": text,
+                    "size": size,
+                    "font": "OCR",
+                    "flags": 0,
+                    "page": page.number,
+                    "x0": ocr_data['left'][i] / 2,
+                    "x1": (ocr_data['left'][i] + ocr_data['width'][i]) / 2,
+                    "y0": ocr_data['top'][i] / 2,
+                    "width": page_width,
+                    "ocr": True
+                })
+    return spans
+
+def group_lines(spans):
+    # Merges spans that are on the same line into a single line entry
+    lines = []
+    spans.sort(key=lambda s: (s["page"], s["y0"], s["x0"]))
+    current_line = None
+    for s in spans:
+        if current_line and abs(current_line["y0"] - s["y0"]) < 2 and current_line["page"] == s["page"]:
+            current_line["spans"].append(s)
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = {"page": s["page"], "y0": s["y0"], "spans": [s]}
+    if current_line:
+        lines.append(current_line)
+
+    output = []
+    for line in lines:
+        text = " ".join(s["text"] for s in line["spans"])
+        size = np.mean([s["size"] for s in line["spans"]])
+        alpha = sum(c.isalpha() for c in text) / max(len(text), 1)
+        width_frac = (max(s["x1"] for s in line["spans"]) - min(s["x0"] for s in line["spans"])) / line["spans"][0]["width"]
+        x0 = min(s["x0"] for s in line["spans"])
+        ocr = any(s.get("ocr", False) for s in line["spans"])
+        trailing = " " if text and text[-1] == " " else ""
+        output.append({
+            "text": text.strip() + trailing,
+            "size": round(size, 2),
+            "font": line["spans"][0]["font"],
+            "page": line["page"],
+            "y0": line["y0"],
+            "alpha": round(alpha, 2),
+            "wf": round(width_frac, 2),
+            "x0": round(x0, 2),
+            "ocr": ocr
+        })
+    return output
+
+def join_numbered_fields(lines):
+    # Merges lines like "1.2" and "Introduction" into "1.2 Introduction"
+    joined = []
+    i = 0
+    while i < len(lines):
+        current = lines[i]["text"].strip()
+        next_line = lines[i+1]["text"].strip() if i + 1 < len(lines) else ""
+        if re.match(r'^\d+(\.\d+)*\.?$', current) and next_line and len(next_line.split()) <= 10:
+            merged_text = current + " " + next_line
+            joined.append({
+                **lines[i],
+                "text": merged_text,
+                "size": max(lines[i]["size"], lines[i+1]["size"]),
+            })
+            i += 2
+        else:
+            joined.append(lines[i])
+            i += 1
+    return joined
+
+def is_repeated_digit_line(text):
+    # Skips headings like "10 10 10 10"
+    tokens = text.strip().split()
+    if len(tokens) >= 3 and all(t.isdigit() and t == tokens[0] for t in tokens):
+        return True
+    return False
+
+def merge_split_headings(lines, font_size_threshold=1.0, vertical_threshold=32):
+    # Merges consecutive lines that probably form a split heading (common in scanned PDFs)
+    merged = []
+    i = 0
+    while i < len(lines):
+        cur = lines[i]
+        merged_line = cur.copy()
+        while (
+            i+1 < len(lines)
+            and lines[i+1]["page"] == merged_line["page"]
+            and abs(lines[i+1]["y0"] - merged_line["y0"]) < vertical_threshold
+            and abs(lines[i+1]["size"] - merged_line["size"]) < font_size_threshold
+            and not merged_line["text"].endswith(".")   # Avoid merging paragraphs
+            and len(lines[i+1]["text"].split()) < 8     # Only merge short heading parts
+        ):
+            # Merge text and use max font size
+            merged_line["text"] = (merged_line["text"].rstrip() + " " + lines[i+1]["text"].lstrip()).strip()
+            merged_line["size"] = max(merged_line["size"], lines[i+1]["size"])
+            i += 1
+        merged.append(merged_line)
+        i += 1
+    return merged
