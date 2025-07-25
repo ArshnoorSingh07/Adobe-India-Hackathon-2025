@@ -300,3 +300,83 @@ def ocr_title_fallback(pdf_path):
         print("OCR TITLE CANDIDATE:", likely_title)
         return likely_title
     return ""
+
+def classify_headings(lines, n_levels=4, pdf_path=None):
+    # Main heading classification function: assigns title, heading level, and outline structure
+    filtered_lines, repeated_texts = filter_repeated_lines(lines)
+    avg_size = np.mean([l["size"] for l in filtered_lines]) if filtered_lines else 12
+    heading_lines = []
+    for l in filtered_lines:
+        if not is_footer_like(l["text"]):
+            if is_valid_heading(l["text"], ocr=l.get("ocr", False), size=l["size"], avg_size=avg_size, wf=l["wf"], alpha=l["alpha"]):
+                heading_lines.append(l)
+    title = ""
+    try:
+        # Try to get title from first 2 pages, using largest font size
+        page1_lines = [l for l in heading_lines if l["page"] <= 2]
+        if page1_lines:
+            max_size = max(l["size"] for l in page1_lines)
+            title_candidates = [l for l in page1_lines if abs(l["size"] - max_size) < 1]
+            for l in sorted(title_candidates, key=lambda x: x["y0"]):
+                if is_valid_title(l["text"]):
+                    title = l["text"]
+                    break
+            if not title and title_candidates:
+                title = title_candidates[0]["text"]
+        if not title:
+            all_page1_lines = [l for l in lines if l["page"] == 0 and len(l["text"]) > 5]
+            if all_page1_lines:
+                title = max(all_page1_lines, key=lambda x: x["size"])["text"]
+        if not title and pdf_path is not None:
+            title = ocr_title_fallback(pdf_path)
+            if not title:
+                title = "Untitled Document"
+    except Exception as e:
+        print(f"\u26a0 Title extraction error: {e}")
+        title = "Untitled Document"
+
+    headings = [l for l in heading_lines if l["text"] != title]
+
+    outline = []
+    sizes = sorted(set(l["size"] for l in headings), reverse=True)
+    size_to_level = {sz: f"H{rank+1}" for rank, sz in enumerate(sizes)}
+    for l in headings:
+        lvl = get_heading_level_from_number(l["text"])
+        if lvl:
+            l["level"] = lvl
+        else:
+            l["level"] = size_to_level.get(l["size"], "H4")
+        # Only keep H1/H2/H3 and skip repeated digit headings
+        if l.get("level") in ["H1", "H2", "H3"] and not is_repeated_digit_line(l["text"]):
+            outline.append({"level": l["level"], "text": l["text"], "page": l["page"]})
+    seen = set()
+    deduped = []
+    for item in outline:
+        tup = (item["level"], item["text"], item["page"])
+        if tup not in seen:
+            deduped.append(item)
+            seen.add(tup)
+    outline = deduped
+
+    if not outline:
+        outline = fallback_extract_headings(lines, title)
+    return {"title": title, "outline": outline, "lines_with_levels": lines}
+
+def process_all_pdfs():
+    # Main entry point: runs heading extraction for every PDF in the input folder
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for fn in os.listdir(INPUT_DIR):
+        if not fn.lower().endswith(".pdf"): continue
+        pdf_path = os.path.join(INPUT_DIR, fn)
+        spans = extract_spans(pdf_path)
+        lines = group_lines(spans)
+        lines = join_numbered_fields(lines)
+        lines = merge_split_headings(lines)   # Try to combine headings split across lines
+        result = classify_headings(lines, pdf_path=pdf_path)
+        base = os.path.splitext(os.path.basename(pdf_path))[0]
+        out_json = os.path.join(OUTPUT_DIR, base + ".json")
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump({"title": result["title"], "outline": result["outline"]}, f, indent=2, ensure_ascii=False)
+
+if __name__ == "__main__":
+    process_all_pdfs()
