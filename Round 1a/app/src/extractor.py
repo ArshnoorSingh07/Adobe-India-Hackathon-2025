@@ -260,3 +260,43 @@ def merge_split_headings(lines, font_size_threshold=1.0, vertical_threshold=32):
         merged.append(merged_line)
         i += 1
     return merged
+
+def fallback_extract_headings(lines, title):
+    # Backup: try to extract headings if all other logic fails
+    seen = set()
+    fallback = []
+    for l in lines:
+        txt = l["text"].strip()
+        if (
+            txt != title and 8 <= len(txt) <= 50 and l["x0"] < 180
+            and not is_footer_like(txt)
+            and not is_table_like_line(txt)
+            and not is_form_label_line(txt, l["wf"], l["x0"])
+            and not is_paragraph_like(txt, l["wf"], l["alpha"])
+            and txt not in seen
+            and not txt.startswith("\u2022")
+            and txt.lower() != txt
+            and txt[0].isalpha()
+            and not is_repeated_digit_line(txt)
+        ):
+            if txt.count("\u2022") > 1 or l["x0"] > 200:
+                continue
+            fallback.append({"level": "H1", "text": txt, "page": l["page"]})
+            seen.add(txt)
+    return fallback
+
+def ocr_title_fallback(pdf_path):
+    # OCR fallback to guess the title from the top of the first page
+    doc = fitz.open(pdf_path)
+    page = doc[0]
+    rect = page.rect
+    top_crop = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + 0.20 * rect.height)
+    pix = page.get_pixmap(matrix=fitz.Matrix(2,2), clip=top_crop)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    text = pytesseract.image_to_string(img, lang=OCR_LANGS)
+    lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 8]
+    if lines:
+        likely_title = max(lines, key=len)
+        print("OCR TITLE CANDIDATE:", likely_title)
+        return likely_title
+    return ""
