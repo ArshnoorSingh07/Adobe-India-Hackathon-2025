@@ -1,6 +1,6 @@
 PyMuPDF
-numpy
+numpy==1.26.4
 scikit-learn
 sentence-transformers
 transformers
-torch
+torch==2.2.2
